@@ -1,173 +1,379 @@
-# Caygnus Product Engineering Challenge
+# Webhook Retry Engine
 
-We are hiring a **Product Engineer / Full-Stack Developer** to build and ship products in the AI space at Caygnus.
+A durable webhook delivery service built with Node.js, PostgreSQL, Redis, and BullMQ.
 
-We care less about years of experience and more about evidence: what you have shipped, the complexity or scale you have handled, and how you make engineering and product decisions. The role is available in a **remote or hybrid** working arrangement.
+The engine accepts webhook events, persists them before scheduling delivery, delivers them asynchronously, retries transient failures with exponential backoff, prevents duplicate ingestion, and exposes delivery state and attempt history through an API.
 
-## Start here
+## Architecture
 
-Choose **one** problem and build a focused proof of your approach:
+```text
+                    POST /events
+                         │
+                         ▼
+                ┌─────────────────┐
+                │   Express API   │
+                └────────┬────────┘
+                         │
+                         ▼
+                ┌─────────────────┐
+                │   PostgreSQL    │
+                │ Source of Truth │
+                └────────┬────────┘
+                         │
+                         ▼
+                ┌─────────────────┐
+                │ BullMQ + Redis  │
+                │    Scheduler    │
+                └────────┬────────┘
+                         │
+                         ▼
+                ┌─────────────────┐
+                │ Webhook Worker  │
+                └────────┬────────┘
+                         │
+                         ▼
+                  External Webhook
+                     Receiver
+```
 
-| Problem | Primary signal | Detailed brief |
-| --- | --- | --- |
-| Offline mobile queue | Mobile state, persistence, synchronization, and failure recovery | [View problem 1](problems/01-offline-mobile-queue/README.md) |
-| Webhook retry engine | Backend reliability, delivery semantics, retries, and idempotency | [View problem 2](problems/02-webhook-retry-engine/README.md) |
-| Reconnecting real-time feed | Real-time communication, reconnection, ordering, and deduplication | [View problem 3](problems/03-reconnecting-realtime-feed/README.md) |
-| Observable agent loop | Agent control flow, tool execution, observability, and safety limits | [View problem 4](problems/04-observable-agent-loop/README.md) |
+PostgreSQL is the source of truth for event and delivery state. Redis/BullMQ is used for asynchronous scheduling and delayed jobs.
 
-Read this page first, then read the complete brief for your selected problem. The problem-specific brief is the source of truth for its acceptance criteria.
+## Core Design
 
-## What this challenge is—and is not
+The implementation follows these principles:
 
-This is a focused credibility exercise, not a request for a production-ready product. We want to understand how you:
+- Persist the event before scheduling delivery.
+- Use a unique `eventId` for ingestion idempotency.
+- Store every delivery attempt in PostgreSQL.
+- Use BullMQ for asynchronous delivery scheduling.
+- Retry transient failures using exponential backoff.
+- Stop retrying after a bounded number of attempts.
+- Recover deliveries that become stuck in `DELIVERING`.
+- Periodically redispatch persisted events that are ready but are not currently queued.
+- Expose current event state and attempt history through the API.
 
-- Identify the important part of a problem
-- Structure software into clear responsibilities
-- Choose appropriate data structures and interfaces
-- Handle realistic failure and recovery cases
-- Write maintainable, idiomatic code
-- Test important behavior
-- Explain decisions and trade-offs
+The queue is treated as a delivery mechanism, not as the durable source of truth.
 
-We do **not** expect authentication, production infrastructure, elaborate visual design, or a long feature list. Extra scope does not compensate for an unreliable core implementation.
+## Delivery Semantics
 
-## Time and technology
+The engine provides **at-least-once delivery semantics**.
 
-- Submit your solution within **72 hours** of receiving or starting the challenge.
-- We recommend spending approximately **6–8 hours** of active work.
-- You may use **any language, framework, database, infrastructure, or model provider**.
-- Explain why you selected your stack and its important trade-offs.
-- An incomplete but well-reasoned submission is better than a large, overbuilt submission.
+Exactly-once delivery cannot be guaranteed across an external HTTP boundary. For example, a worker may successfully send an HTTP request and then crash before recording the successful result in PostgreSQL. Retrying in that situation can result in another request.
 
-If a requirement is unclear, make a reasonable assumption, document it, and continue. We evaluate the quality of your decision—not whether you guessed an unstated preference.
+For this reason, consumers should use the stable `eventId` as their own idempotency key when exactly-once business processing is required.
 
-## How to complete the challenge
+## Retry Policy
 
-1. Fork this repository.
-2. Choose one problem from the table above.
-3. Build your solution in your fork using any structure appropriate for your stack.
-4. Copy [SUBMISSION_TEMPLATE.md](SUBMISSION_TEMPLATE.md) to `SUBMISSION.md` and complete every section.
-5. Add focused automated tests.
-6. Record the required demo video.
-7. Verify that setup instructions and video permissions work for someone outside your account.
-8. Submit the link to your fork.
+The default configuration allows up to five delivery attempts.
 
-Do not modify the problem statement to make your implementation appear compliant. If you intentionally interpret a requirement differently, explain the interpretation in `SUBMISSION.md`.
+The following HTTP responses are treated as retryable:
 
-## Required submission evidence
+- `408 Request Timeout`
+- `425 Too Early`
+- `429 Too Many Requests`
+- `500 Internal Server Error`
+- `502 Bad Gateway`
+- `503 Service Unavailable`
+- `504 Gateway Timeout`
 
-A submission is complete only when it contains all of the following.
+Network errors and request timeouts are also retryable.
 
-### 1. Runnable source code
+The retry delay follows exponential backoff:
 
-The reviewer must be able to run the selected acceptance scenario. Never commit API keys, credentials, access tokens, private datasets, or other secrets.
+```text
+delay = RETRY_BASE_DELAY_MS × 2^(attempt - 1)
+```
 
-### 2. Completed `SUBMISSION.md`
+After the configured maximum number of attempts, the event transitions to `FAILED` and no further retry is scheduled.
 
-Use the provided [submission template](SUBMISSION_TEMPLATE.md). It asks for:
+Successful `2xx` responses complete the delivery.
 
-- The selected problem
-- Setup and run instructions
-- Architecture and data flow
-- Technology choices and trade-offs
-- Assumptions and limitations
-- Production and scale considerations
-- AI usage disclosure
-- A credibility note about previously shipped work
+Other non-retryable HTTP responses are treated as terminal failures.
 
-Aim for setup instructions that a reviewer can follow within approximately 10 minutes.
+## Idempotency
 
-### 3. Focused tests
+`eventId` is the idempotency key for event ingestion.
 
-At minimum, include:
+The database enforces uniqueness on the event ID, making concurrent duplicate requests safe at the persistence layer.
 
-- One test covering an important successful path
-- One test covering a relevant failure or recovery path
+For example:
 
-We value meaningful tests over a high coverage percentage. Tests should not depend on paid external services to pass.
+```text
+POST /events eventId=order_123
+        │
+        └── creates event
 
-### 4. Demo video
+POST /events eventId=order_123
+        │
+        └── duplicate → existing event returned
 
-Attach a **3–5 minute demo video** using Loom, YouTube, Google Drive, or another accessible service. Put the link near the top of `SUBMISSION.md`.
+POST /events eventId=order_123
+        │
+        └── duplicate → existing event returned
+```
 
-The video must show:
+Only the original event creates delivery work.
 
-- The project running
-- The required successful scenario
-- At least one relevant failure or recovery scenario
-- A brief explanation of the architecture
-- One important technical decision or trade-off
+The end-to-end test verifies that repeated ingestion of the same event results in a single delivery attempt.
 
-A straightforward screen recording with narration is sufficient. Production-quality editing is not expected. A submission without an accessible demo video is incomplete.
+## Failure Recovery
 
-### 5. Credibility note
+### Database Commit → Queue Enqueue
 
-Briefly describe one product or system you previously helped ship:
+The event is persisted first. If the process crashes before the BullMQ job is created, the event still exists in PostgreSQL.
 
-- What problem it solved
-- Your personal contribution
-- The scale or operational complexity involved
-- One difficult engineering or product decision you made
-- A public link, repository, case study, or other evidence when available
+A periodic recovery/dispatch process scans for persisted events that are ready for delivery and ensures they are scheduled.
 
-You may anonymize confidential details and use approximate figures. Scale can be demonstrated through users, traffic, concurrency, data volume, latency, reliability, cost, deployment complexity, or operational responsibility.
+### Worker Crash During Delivery
 
-## Using AI tools
+A delivery can remain in `DELIVERING` if the worker disappears while an HTTP request is in progress.
 
-You may use AI tools while completing this challenge. AI usage will not reduce your score.
+Delivery attempts therefore record when delivery started. Stale deliveries are detected after the configured lease timeout and recovered so they can be retried.
 
-Disclose which tools you used and how you used them. You remain responsible for everything in your submission. We are not evaluating how much code you typed manually; we are evaluating the software you chose to submit and your understanding of it.
+## API
 
-During review, we will consider:
+### Create an Event
 
-- How you decomposed the problem
-- The boundaries and interfaces between components
-- Your data structures and data flow
-- Coding patterns, consistency, and idiomatic use of your chosen stack
-- Readability, naming, and maintainability
-- Error handling and failure recovery
-- Whether abstractions are useful rather than unnecessary
-- Whether tests cover the most important behavior
+```http
+POST /events
+Content-Type: application/json
+```
 
-You should be able to explain any part of the submission. In a follow-up discussion, we may ask you to make or describe a small change.
+Example:
 
-## How we evaluate submissions
+```json
+{
+  "eventId": "evt_123",
+  "type": "order.created",
+  "occurredAt": "2026-09-19T10:00:00.000Z",
+  "payload": {
+    "orderId": "order_123"
+  }
+}
+```
 
-Reviewers use the same public [review scorecard](REVIEW_SCORECARD.md) for every technology stack and problem choice.
+A first submission creates the event.
 
-| Area | Weight | What we look for |
-| --- | ---: | --- |
-| Core correctness | 25% | The selected acceptance scenarios work consistently and produce the expected outcomes. |
-| Software architecture and decomposition | 25% | Responsibilities, boundaries, interfaces, and data flow are clear and appropriate. |
-| Coding patterns and maintainability | 20% | The code is readable, consistent, idiomatic, and no more complicated than necessary. |
-| Failure handling | 15% | Important failures are identified, observable, and handled deliberately. |
-| Testing | 10% | Tests focus on valuable success, failure, and recovery behavior. |
-| Communication and trade-offs | 5% | Decisions, assumptions, limitations, and alternatives are explained clearly. |
+A repeated `eventId` is treated as a duplicate and does not create another delivery.
 
-### Evaluation levels
+### Get Event Status
 
-- **Meets expectations:** The required scenarios work, important decisions are explained, and the specified failure behavior is covered.
-- **Strong:** The implementation handles subtle edge cases, is easy to inspect, and demonstrates thoughtful trade-offs.
-- **Exceptional:** The candidate identifies a meaningful risk we did not prescribe and addresses it simply, without unnecessary complexity.
+```http
+GET /events/:eventId
+```
 
-We do not award additional points for visual polish, deployment, fashionable technology choices, or unrelated features unless they materially improve the selected capability.
+Returns the current event state together with its delivery attempts.
 
-## Reasons a submission may be incomplete
+Example:
 
-- The repository is inaccessible to the reviewer.
-- The demo video is missing or inaccessible.
-- Setup instructions are absent or cannot reasonably be followed.
-- The selected problem is not identified.
-- The core acceptance scenario is not demonstrated.
-- Secrets or private credentials are committed.
-- Large portions of submitted code cannot be explained by the candidate.
+```json
+{
+  "eventId": "evt_123",
+  "status": "SUCCEEDED",
+  "attempts": [
+    {
+      "attemptNumber": 1,
+      "status": "SUCCEEDED",
+      "httpStatus": 200
+    }
+  ]
+}
+```
 
-An incomplete optional feature is not a reason for rejection. Clearly label unfinished work and prioritize the required behavior.
+### Health Check
 
-## How to apply
+```http
+GET /health
+```
 
-Submit your repository through [the application form](https://binary.so/rVZvEeJ), or email it to [caygnus@gmail.com](mailto:caygnus@gmail.com).
+## Local Development
 
-Include your resume and links to products or projects you have worked on or shipped.
+### Requirements
 
-We look forward to seeing how you think and build.
+- Node.js 24+
+- Docker
+- Docker Compose
+- npm
+
+### Install
+
+```bash
+npm install
+```
+
+### Configure Environment
+
+Copy the example environment file:
+
+```bash
+cp .env.example .env
+```
+
+On Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+### Start Infrastructure
+
+```bash
+docker compose up -d
+```
+
+### Start the Engine
+
+```bash
+npm start
+```
+
+The API runs on:
+
+```text
+http://localhost:3000
+```
+
+## Mock Webhook Receiver
+
+The repository includes a mock webhook receiver for local development and end-to-end testing.
+
+It can simulate:
+
+- successful delivery
+- HTTP 400
+- HTTP 500
+- HTTP 503
+- request timeout
+
+This makes it possible to test retry and failure behavior without relying on an external service.
+
+## Testing
+
+The end-to-end test exercises the complete delivery path through the real HTTP API, database, queue, worker, and mock receiver.
+
+It covers four scenarios:
+
+1. Successful delivery
+2. Temporary `503` failure followed by retry and success
+3. Retry exhaustion after five attempts
+4. Duplicate event ingestion / idempotency
+
+Run:
+
+```bash
+npm test
+```
+
+The test intentionally runs the four scenarios inside one sequential end-to-end test because the mock receiver has shared mutable state. Keeping the scenarios in one execution makes the receiver mode transitions deterministic.
+
+Expected result:
+
+```text
+Test Files  1 passed
+Tests       1 passed
+```
+
+The single passing test contains all four end-to-end scenarios.
+
+## Configuration
+
+| Variable | Purpose | Default |
+|---|---|---:|
+| `PORT` | API port | `3000` |
+| `DATABASE_URL` | PostgreSQL connection | Local PostgreSQL |
+| `REDIS_HOST` | Redis hostname | `localhost` |
+| `REDIS_PORT` | Redis port | `6379` |
+| `WEBHOOK_URL` | Destination webhook | Local receiver |
+| `MAX_ATTEMPTS` | Maximum delivery attempts | `5` |
+| `RETRY_BASE_DELAY_MS` | Base retry delay | `2000` |
+| `DELIVERY_LEASE_TIMEOUT_MS` | Stale delivery timeout | `30000` |
+| `REQUEST_TIMEOUT_MS` | Outbound HTTP timeout | `3000` |
+
+## Project Structure
+
+```text
+.
+├── receiver/
+│   └── server.js
+├── src/
+│   ├── db/
+│   ├── queue/
+│   ├── services/
+│   └── server.js
+├── tests/
+│   └── webhook-engine.test.js
+├── drizzle/
+├── docker-compose.yml
+├── drizzle.config.js
+├── package.json
+├── package-lock.json
+└── .env.example
+```
+
+## Technology Choices
+
+### Node.js + Express
+
+Used for the HTTP API and service runtime.
+
+### PostgreSQL
+
+Used as the durable source of truth for events, delivery state, attempt history, and retry scheduling state.
+
+### Drizzle ORM
+
+Used for database schema and application-level database access.
+
+### Redis + BullMQ
+
+Used for asynchronous delivery scheduling and background workers.
+
+BullMQ is deliberately not treated as the source of truth for event state.
+
+### Zod
+
+Used for request and configuration validation.
+
+### Vitest
+
+Used for end-to-end verification of the webhook delivery flow.
+
+## Trade-offs
+
+### PostgreSQL + Redis
+
+PostgreSQL provides durable state and transactional uniqueness for idempotency. Redis/BullMQ provides efficient asynchronous scheduling and delayed jobs.
+
+Using PostgreSQL as the source of truth also makes event state and delivery history independently inspectable from the queue.
+
+### Recovery Without an Outbox Table
+
+The implementation uses persisted event state together with a periodic dispatcher/recovery mechanism instead of introducing a separate outbox table.
+
+This keeps the data model smaller while still addressing the failure window between a successful database commit and queue scheduling.
+
+### At-Least-Once Delivery
+
+The service deliberately uses at-least-once semantics rather than claiming exactly-once external delivery.
+
+Exactly-once behavior across an external HTTP boundary requires cooperation from the receiving system. The stable event ID allows consumers to implement idempotent processing on their side.
+
+## Failure Scenarios
+
+| Failure | Behavior |
+|---|---|
+| `2xx` response | Delivery succeeds |
+| `408/425/429` | Retry |
+| `500/502/503/504` | Retry |
+| Network error | Retry |
+| Request timeout | Retry |
+| Retry limit reached | Terminal `FAILED` |
+| Duplicate event ID | No duplicate delivery |
+| Worker crash during delivery | Stale delivery can be recovered |
+| Database commit before queue enqueue | Recovery dispatcher can redispatch |
+
+## Scope
+
+This implementation focuses on the requested webhook retry engine and its reliability characteristics.
+
+The solution intentionally avoids unrelated production features such as authentication, multi-tenant routing, distributed rate limiting, webhook signing, and a dedicated dead-letter queue UI.
